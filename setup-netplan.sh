@@ -1,99 +1,128 @@
 #!/bin/bash
 
 # ==============================================================================
-# Скрипт для настройки сети Netplan (v6) - Priority & Dual IP PBR
+# 🏴‍☠️ ALCHEMIST NETPLAN CONFIGURATOR v7 (Dual IP + PBR + Auto-Rotation)
 # ==============================================================================
 
-if ! [ -t 0 ]; then
-    echo "🚫 Ошибка: Запускайте через: sudo bash -c \"\$(curl -sSL [URL])\""
-    exit 1
-fi
-
 if [[ $EUID -ne 0 ]]; then
-   echo "🚫 Ошибка: Требуются права sudo."
+   echo "🚫 Ошибка: Запускай из-под root (sudo)."
    exit 1
 fi
 
 clear
-echo "🚀 Настройка Netplan v6 (Выход через второй IP: Priority 100)"
-echo "--------------------------------------------------------"
+echo "⚔️  Настройка сети: PBR (Policy Based Routing) & Ротация IP"
+echo "⚠️  Внимание: Скрипт полностью перезапишет /etc/netplan/01-netcfg.yaml"
+echo "---------------------------------------------------------------------"
 
-# --- Авто-определение ---
-current_ipv4_ens3=$(ip -4 addr show ens3 | grep -oP 'inet \K[\d.\/]+' | head -n 1)
-current_ipv6_ens3=$(ip -6 addr show ens3 | grep -oP 'inet6 \K[0-9a-fA-F:\/]+' | grep -v '^fe80' | head -n 1)
-current_ipv4_ens6=$(ip -4 addr show ens6 | grep -oP 'inet \K[\d.\/]+' | head -n 1)
+# --- 1. Сбор разведданных (текущие IP) ---
+# Получаем список всех IPv4 на ens3 в массив
+mapfile -t current_ips < <(ip -4 addr show ens3 | grep -oP 'inet \K[\d.]+' | grep -v '127.0.0.1')
+current_ipv6=$(ip -6 addr show ens3 | grep -oP 'inet6 \K[0-9a-fA-F:\/]+' | grep -v '^fe80' | head -n 1)
+ens6_ip=$(ip -4 addr show ens6 | grep -oP 'inet \K[\d.\/]+' | head -n 1)
 
-# --- Ввод данных ---
-read -e -p "1️⃣  Основной IPv4 (Priority 200): " -i "$current_ipv4_ens3" ipv4_1
-[[ -n "$ipv4_1" && ! "$ipv4_1" == *"/"* ]] && ipv4_1="$ipv4_1/24"
-ip_only1=$(echo $ipv4_1 | cut -d'/' -f1)
-suggested_gw1=$(echo $ip_only1 | awk -F. '{print $1"."$2"."$3".1"}')
-read -e -p "   Шлюз для первого IP: " -i "$suggested_gw1" gateway4_1
+# Логика авто-предложения (Ротация)
+# Если есть 2 IP, то по умолчанию предлагаем:
+#   Main (New) = Второй найденный (бывший доп)
+#   Secondary (Old) = Первый найденный (бывший main)
+def_main=""
+def_sec=""
 
-echo "--------------------------------------------------------"
-read -e -p "2️⃣  Второй IPv4 (Priority 100 - EXIT IP): " ipv4_2
-if [[ -n "$ipv4_2" ]]; then
-    [[ ! "$ipv4_2" == *"/"* ]] && ipv4_2="$ipv4_2/24"
-    ip_only2=$(echo $ipv4_2 | cut -d'/' -f1)
-    suggested_gw2=$(echo $ip_only2 | awk -F. '{print $1"."$2"."$3".1"}')
-    read -e -p "   Шлюз для второго IP: " -i "$suggested_gw2" gateway4_2
+if [ ${#current_ips[@]} -ge 2 ]; then
+    def_main="${current_ips[1]}" # Второй становится главным
+    def_sec="${current_ips[0]}"  # Первый уходит во вторичные
+elif [ ${#current_ips[@]} -eq 1 ]; then
+    def_sec="${current_ips[0]}"  # Единственный уходит во вторичные (освобождая место под новый)
+    def_main=""                  # Ждем ввода нового
 fi
 
-echo "--------------------------------------------------------"
-read -e -p "3️⃣  IPv6 для ens3: " -i "$current_ipv6_ens3" ipv6_ens3
-[[ -n "$ipv6_ens3" && ! "$ipv6_ens3" == *"/"* ]] && ipv6_ens3="$ipv6_ens3/64"
+# Ф-ция вычисления шлюза (грубая, .1 на конце)
+calc_gw() {
+    echo "$1" | awk -F. '{print $1"."$2"."$3".1"}'
+}
 
-read -e -p "4️⃣  Локальный IP для ens6: " -i "$current_ipv4_ens6" ipv4_ens6
-[[ -n "$ipv4_ens6" && ! "$ipv4_ens6" == *"/"* ]] && ipv4_ens6="$ipv4_ens6/16"
+# --- 2. Интервью ---
 
-# --- Логика формирования блоков ---
+# --- ГЛАВНЫЙ IP (NEW) ---
+echo -e "\n🔵 [ГЛАВНЫЙ IP] Будет использоваться по умолчанию для выхода."
+read -e -p "   IP адрес: " -i "$def_main" ip_main_input
+[[ "$ip_main_input" != *"/"* && -n "$ip_main_input" ]] && ip_main_input="${ip_main_input}/24"
+ip_main_pure=$(echo "$ip_main_input" | cut -d'/' -f1)
+gw_main_def=$(calc_gw "$ip_main_pure")
 
-# 1. Список адресов
-ADDR_LIST="- \"$ipv4_1\""
-[[ -n "$ipv4_2" ]] && ADDR_LIST="$ADDR_LIST
-        - \"$ipv4_2\""
-[[ -n "$ipv6_ens3" ]] && ADDR_LIST="$ADDR_LIST
-        - \"$ipv6_ens3\""
+read -e -p "   Шлюз: " -i "$gw_main_def" gw_main
+echo "   -> Метрика: 50 (Высший приоритет)"
 
-# 2. Маршруты и Политики
-if [[ -n "$ipv4_2" ]]; then
-    # Если два IP: настраиваем приоритеты и PBR для обоих, чтобы не было конфликтов
-    ROUTES="- to: default
-          via: $gateway4_1
+# --- ВТОРОСТЕПЕННЫЙ IP (OLD/LEGACY) ---
+echo -e "\n🟠 [ВТОРОЙ IP] Для доживания/ротации. Входящие работают корректно."
+read -e -p "   IP адрес (Enter, если нет): " -i "$def_sec" ip_sec_input
+if [[ -n "$ip_sec_input" ]]; then
+    [[ "$ip_sec_input" != *"/"* ]] && ip_sec_input="${ip_sec_input}/24"
+    ip_sec_pure=$(echo "$ip_sec_input" | cut -d'/' -f1)
+    gw_sec_def=$(calc_gw "$ip_sec_pure")
+    read -e -p "   Шлюз: " -i "$gw_sec_def" gw_sec
+    echo "   -> Метрика: 200 (Низкий приоритет)"
+fi
+
+# --- IPv6 и Local ---
+echo -e "\n⚪ [ПРОЧЕЕ]"
+read -e -p "   IPv6 (ens3): " -i "$current_ipv6" ipv6_input
+[[ -n "$ipv6_input" && "$ipv6_input" != *"/"* ]] && ipv6_input="${ipv6_input}/64"
+
+read -e -p "   IPv4 Local (ens6): " -i "$ens6_ip" ens6_input
+[[ -n "$ens6_input" && "$ens6_input" != *"/"* ]] && ens6_input="${ens6_input}/16"
+
+# --- 3. Генерация конфига ---
+
+# Формируем список адресов
+ADDRESSES="        - $ip_main_input"
+[[ -n "$ip_sec_input" ]] && ADDRESSES="${ADDRESSES}\n        - $ip_sec_input"
+[[ -n "$ipv6_input" ]] && ADDRESSES="${ADDRESSES}\n        - \"$ipv6_input\""
+
+# Формируем маршруты (Routes)
+# Main IP route (table 100)
+ROUTES="        # --- Routes for Main IP ---
+        - to: 0.0.0.0/0
+          via: $gw_main
+          metric: 50
+          table: 100
+        - to: 0.0.0.0/0
+          via: $gw_main
+          metric: 50"
+
+# Secondary IP route (table 101)
+if [[ -n "$ip_sec_input" ]]; then
+ROUTES="$ROUTES
+        # --- Routes for Secondary IP ---
+        - to: 0.0.0.0/0
+          via: $gw_sec
           metric: 200
-          on-link: true
-        - to: default
-          via: $gateway4_2
-          metric: 100
-          on-link: true
-        - to: 0.0.0.0/0
-          via: $gateway4_1
           table: 101
         - to: 0.0.0.0/0
-          via: $gateway4_2
-          table: 102"
-    
-    POLICIES="      routing-policy:
-        - from: $ip_only1
-          table: 101
-        - from: $ip_only2
-          table: 102"
-else
-    # Если один IP: просто стандартный шлюз
-    ROUTES="- to: default
-          via: $gateway4_1
-          metric: 100
-          on-link: true"
-    POLICIES=""
+          via: $gw_sec
+          metric: 200"
 fi
 
-# Добавляем IPv6 маршрут если он есть
-[[ -n "$ipv6_ens3" ]] && ROUTES="$ROUTES
+# IPv6 Route
+if [[ -n "$ipv6_input" ]]; then
+ROUTES="$ROUTES
         - to: default
           via: \"fe80::1\"
           on-link: true"
+fi
 
-# --- Сборка файла ---
+# Формируем политики (Routing Policy)
+# Суть: "Если пакет пришел ОТ этого IP, используй таблицу этого IP"
+POLICIES="      routing-policy:
+        - from: $ip_main_pure
+          table: 100"
+
+if [[ -n "$ip_sec_input" ]]; then
+POLICIES="$POLICIES
+        - from: $ip_sec_pure
+          table: 101"
+fi
+
+# Сборка файла
 cat > /etc/netplan/01-netcfg.yaml << EOF
 network:
   version: 2
@@ -101,25 +130,44 @@ network:
   ethernets:
     ens3:
       addresses:
-        $ADDR_LIST
+$ADDRESSES
       nameservers:
-        addresses: [8.8.8.8, 1.1.1.1]
+        addresses:
+          # IPv4
+          - 1.1.1.1        # Cloudflare (Скорость + Приватность)
+          - 8.8.8.8        # Google (Стабильность)
+          - 9.9.9.9        # Quad9 (Безопасность: блокирует вредоносные домены)
+          - 1.0.0.1        # Cloudflare Secondary
+          - 8.8.4.4        # Google Secondary
+          - 149.112.112.112 # Quad9 Secondary
+          # IPv6 (рекомендуется для полноты стека)
+          - "2606:4700:4700::1111"
+          - "2001:4860:4860::8888"
+          - "2620:fe::fe"
       routes:
-        $ROUTES
+$ROUTES
 $POLICIES
 EOF
 
-if [[ -n "$ipv4_ens6" ]]; then
+# Добавляем ens6 если есть
+if [[ -n "$ens6_input" ]]; then
 cat >> /etc/netplan/01-netcfg.yaml << EOF
     ens6:
       addresses:
-        - "$ipv4_ens6"
+        - "$ens6_input"
 EOF
 fi
 
+# --- 4. Финал ---
 chmod 600 /etc/netplan/01-netcfg.yaml
+echo -e "\n📄 Генерирую конфигурацию..."
+netplan generate
+
+echo -e "\n✅ Конфигурация готова к применению!"
 echo "--------------------------------------------------------"
-cat /etc/netplan/01-netcfg.yaml
+echo "Главный IP: $ip_main_pure (Table 100, Metric 50)"
+[[ -n "$ip_sec_input" ]] && echo "Второй IP:  $ip_sec_pure (Table 101, Metric 200)"
 echo "--------------------------------------------------------"
 
-netplan generate && sleep 1 && netplan try
+read -p "Нажми Enter чтобы применить (netplan try)..."
+netplan try
