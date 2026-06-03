@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# 🏴‍☠️ ALCHEMIST NETPLAN CONFIGURATOR v7.2 (Dynamic PBR Edition)
+# 🏴‍☠️ ALCHEMIST NETPLAN CONFIGURATOR v7.3 (Smart PBR Edition)
 # ==============================================================================
 
 # --- Safety Checks ---
@@ -13,7 +13,6 @@ fi
 BACKUP_FILE="/etc/netplan/01-netcfg.yaml.bak.$(date +%s)"
 CONFIG_FILE="/etc/netplan/01-netcfg.yaml"
 
-# Функция аварийного выхода
 restore_and_exit() {
     echo -e "\n💥 ОБНАРУЖЕНА ОШИБКА ГЕНЕРАЦИИ!"
     echo "🔄 Восстанавливаю предыдущую конфигурацию..."
@@ -27,7 +26,7 @@ restore_and_exit() {
 }
 
 clear
-echo "⚔️  Настройка сети: Dynamic PBR & Multi IP (v7.2)"
+echo "⚔️  Настройка сети: Smart PBR & Multi IP (v7.3)"
 echo "---------------------------------------------------------------------"
 
 # --- 1. Сбор разведданных ---
@@ -41,12 +40,12 @@ if [ ${#current_ips[@]} -ge 2 ]; then
     def_main="${current_ips[1]}"
     def_sec="${current_ips[0]}"
 elif [ ${#current_ips[@]} -eq 1 ]; then
-    def_sec="${current_ips[0]}"
+    def_main="${current_ips[0]}"
 fi
 
 calc_gw() { echo "$1" | awk -F. '{print $1"."$2"."$3".1"}'; }
 
-# --- 2. Интервью (Динамический опрос) ---
+# --- 2. Интервью ---
 
 # MAIN IP
 echo -e "\n🔵 [ГЛАВНЫЙ IP] (Приоритет 50)"
@@ -75,11 +74,15 @@ read -e -p "   IPv6 (ens3): " -i "$current_ipv6" ipv6_input
 read -e -p "   IPv4 Local (ens6): " -i "$ens6_ip" ens6_input
 [[ -n "$ens6_input" && "$ens6_input" != *"/"* ]] && ens6_input="${ens6_input}/16"
 
-# --- 3. Генерация (Структурно-безопасный метод) ---
+# Подсчет количества активных IPv4 для логики PBR
+ipv4_count=0
+[[ -n "$ip_main_input" ]] && ((ipv4_count++))
+[[ -n "$ip_sec_input" ]]  && ((ipv4_count++))
+
+# --- 3. Генерация ---
 
 [[ -f "$CONFIG_FILE" ]] && cp "$CONFIG_FILE" "$BACKUP_FILE"
 
-# Открываем единый блок записи, чтобы не дергать файл сотней I/O операций
 {
     echo "network:"
     echo "  version: 2"
@@ -87,15 +90,15 @@ read -e -p "   IPv4 Local (ens6): " -i "$ens6_ip" ens6_input
     echo "  ethernets:"
     echo "    ens3:"
 
-    # 3.1 Динамический блок адресов
-    if [[ -n "$ip_main_input" || -n "$ip_sec_input" || -n "$ipv6_input" ]]; then
+    # 3.1 Адреса
+    if [[ $ipv4_count -gt 0 || -n "$ipv6_input" ]]; then
         echo "      addresses:"
         [[ -n "$ip_main_input" ]] && echo "        - $ip_main_input"
         [[ -n "$ip_sec_input" ]]  && echo "        - $ip_sec_input"
         [[ -n "$ipv6_input" ]]    && echo "        - \"$ipv6_input\""
     fi
 
-    # 3.2 Блок DNS (Статичный)
+    # 3.2 DNS
     echo "      nameservers:"
     echo "        addresses:"
     echo "          - 1.1.1.1"
@@ -105,28 +108,38 @@ read -e -p "   IPv4 Local (ens6): " -i "$ens6_ip" ens6_input
     echo "          - \"2606:4700:4700::1111\""
     echo "          - \"2001:4860:4860::8888\""
 
-    # 3.3 Динамический блок маршрутов
-    if [[ -n "$ip_main_input" || -n "$ip_sec_input" || -n "$ipv6_input" ]]; then
+    # 3.3 Маршруты (SMART ROUTING)
+    if [[ $ipv4_count -gt 0 || -n "$ipv6_input" ]]; then
         echo "      routes:"
         
         if [[ -n "$ip_main_input" ]]; then
+            # Главный системный маршрут (нужен всегда)
             echo "        - to: 0.0.0.0/0"
             echo "          via: $gw_main"
             echo "          metric: 50"
-            echo "          table: 100"
-            echo "        - to: 0.0.0.0/0"
-            echo "          via: $gw_main"
-            echo "          metric: 50"
+            
+            # Маршрут PBR (только если есть второй IP)
+            if [[ $ipv4_count -eq 2 ]]; then
+                echo "        - to: 0.0.0.0/0"
+                echo "          via: $gw_main"
+                echo "          metric: 50"
+                echo "          table: 100"
+            fi
         fi
 
         if [[ -n "$ip_sec_input" ]]; then
-            echo "        - to: 0.0.0.0/0"
-            echo "          via: $gw_sec"
-            echo "          metric: 200"
-            echo "          table: 101"
-            echo "        - to: 0.0.0.0/0"
-            echo "          via: $gw_sec"
-            echo "          metric: 200"
+            if [[ $ipv4_count -eq 2 ]]; then
+                # PBR маршрут для второго IP
+                echo "        - to: 0.0.0.0/0"
+                echo "          via: $gw_sec"
+                echo "          metric: 200"
+                echo "          table: 101"
+            else
+                # Если главный IP был пропущен, делаем второй IP главным системным шлюзом
+                echo "        - to: 0.0.0.0/0"
+                echo "          via: $gw_sec"
+                echo "          metric: 200"
+            fi
         fi
 
         if [[ -n "$ipv6_input" ]]; then
@@ -136,20 +149,16 @@ read -e -p "   IPv4 Local (ens6): " -i "$ens6_ip" ens6_input
         fi
     fi
 
-    # 3.4 Динамический блок политик маршрутизации (PBR)
-    if [[ -n "$ip_main_input" || -n "$ip_sec_input" ]]; then
+    # 3.4 Политики PBR (ТОЛЬКО ДЛЯ DUAL-IP)
+    if [[ $ipv4_count -eq 2 ]]; then
         echo "      routing-policy:"
-        if [[ -n "$ip_main_input" ]]; then
-            echo "        - from: $ip_main_pure"
-            echo "          table: 100"
-        fi
-        if [[ -n "$ip_sec_input" ]]; then
-            echo "        - from: $ip_sec_pure"
-            echo "          table: 101"
-        fi
+        echo "        - from: $ip_main_pure"
+        echo "          table: 100"
+        echo "        - from: $ip_sec_pure"
+        echo "          table: 101"
     fi
 
-    # 3.5 Локальный интерфейс (ens6)
+    # 3.5 Local Interface (ens6)
     if [[ -n "$ens6_input" ]]; then
         echo "    ens6:"
         echo "      addresses:"
@@ -169,6 +178,7 @@ echo -e "\n✅ Конфигурация валидна!"
 echo "--------------------------------------------------------"
 [[ -n "$ip_main_input" ]] && echo "Главный IP: $ip_main_pure" || echo "Главный IP: ПРОПУЩЕН"
 [[ -n "$ip_sec_input" ]]  && echo "Второй IP:  $ip_sec_pure" || echo "Второй IP:  ПРОПУЩЕН"
+echo "Режим PBR:  $( [[ $ipv4_count -eq 2 ]] && echo 'АКТИВЕН (Dual-IP)' || echo 'ВЫКЛЮЧЕН (Single-IP)' )"
 echo "--------------------------------------------------------"
 
 netplan try
