@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# 🏴‍☠️ ALCHEMIST NETPLAN CONFIGURATOR v8.0 (Universal Smart PBR & Menu Edition)
+# 🏴‍☠️ ALCHEMIST NETPLAN CONFIGURATOR v8.1 (Seamless DNS Rotation & PBR Edition)
 # Target OS: Ubuntu 22.04 / 24.04 LTS (systemd-networkd)
 # ==============================================================================
 
@@ -24,6 +24,7 @@ fi
 
 BACKUP_DIR="/etc/netplan/backups/bak_$(date +%Y%m%d_%H%M%S)"
 CONFIG_FILE="/etc/netplan/01-netcfg.yaml"
+SYSCTL_FILE="/etc/sysctl.d/99-alchemist-pbr.conf"
 
 # --- Функция аварийного отката ---
 restore_and_exit() {
@@ -59,8 +60,8 @@ ensure_mask() {
 }
 
 clear
-echo -e "${C_BOLD}⚔️  ALCHEMIST NETPLAN CONFIGURATOR v8.0 (Smart PBR & Entry/Exit Split)${C_RESET}"
-echo "----------------------------------------------------------------------------"
+echo -e "${C_BOLD}⚔️  ALCHEMIST NETPLAN CONFIGURATOR v8.1 (Smart PBR & Seamless DNS Rotation)${C_RESET}"
+echo "--------------------------------------------------------------------------------"
 
 # ==============================================================================
 # 1. СБОР РАЗВЕДДАННЫХ
@@ -115,14 +116,14 @@ if [[ -n "$slot2_cidr" ]]; then
 else
     echo -e "   ${C_BOLD}2)${C_RESET} [Не задан — сейчас режим 1 IP]"
 fi
-echo "----------------------------------------------------------------------------"
+echo "--------------------------------------------------------------------------------"
 
 # ==============================================================================
 # 2. ИНТЕРВЬЮ И ВЫБОР РОЛЕЙ IP
 # ==============================================================================
 
-# --- 2.1 ВЫБОР ГЛАВНОГО IP (ВЫХОД ТРАФИКА) ---
-echo -e "\n🔵 ${C_BLUE}[ГЛАВНЫЙ IP — Выход трафика / Приоритет 50]${C_RESET}"
+# --- 2.1 ВЫБОР ГЛАВНОГО IP (ВЫХОД ТРАФИКА + ВХОД ПО СТАРОМУ DNS) ---
+echo -e "\n🔵 ${C_BLUE}[ГЛАВНЫЙ IP — Выход трафика (Metric 50) + Прием входящих]${C_RESET}"
 echo -e "   Выбери, какой адрес сделать ${C_BOLD}ОСНОВНЫМ (исходящим)${C_RESET}:"
 [[ -n "$slot1_cidr" ]] && echo -e "     ${C_BOLD}1)${C_RESET} Оставить 1-й IP: ${C_BOLD}${slot1_cidr}${C_RESET}"
 [[ -n "$slot2_cidr" ]] && echo -e "     ${C_BOLD}2)${C_RESET} Сделать основным 2-й IP (Ротация): ${C_BOLD}${slot2_cidr}${C_RESET}"
@@ -166,20 +167,18 @@ read -e -p "   Проверь Главный IP/маску: " -i "$ip_main_input
 ip_main_input=$(ensure_mask "$ip_main_input" "24")
 ip_main_pure=$(strip_mask "$ip_main_input")
 
-# Умный подбор шлюза для Главного IP
 gw_main_def="${detected_gw4:-$(calc_gw "$ip_main_pure")}"
 read -e -p "   Шлюз для Главного IP:     " -i "$gw_main_def" gw_main
 
 
-# --- 2.2 ВЫБОР ВТОРОГО IP (ВХОД КЛИЕНТОВ VPN) ---
-echo -e "\n🟠 ${C_ORANGE}[ВТОРОЙ IP — Вход клиентов VPN / Приоритет 200]${C_RESET}"
+# --- 2.2 ВЫБОР ВТОРОГО IP (ОСНОВНОЙ ВХОД КЛИЕНТОВ VPN) ---
+echo -e "\n🟠 ${C_ORANGE}[ВТОРОЙ IP — Вход клиентов VPN (Metric 200)]${C_RESET}"
 echo -e "   Выбери, какой адрес сделать ${C_BOLD}ДОПОЛНИТЕЛЬНЫМ (входящим)${C_RESET}:"
 [[ -n "$slot1_cidr" ]] && echo -e "     ${C_BOLD}1)${C_RESET} Использовать 1-й IP: ${C_BOLD}${slot1_cidr}${C_RESET}"
 [[ -n "$slot2_cidr" ]] && echo -e "     ${C_BOLD}2)${C_RESET} Использовать 2-й IP: ${C_BOLD}${slot2_cidr}${C_RESET}"
 echo -e "     ${C_BOLD}3)${C_RESET} Указать другой IP вручную"
 echo -e "     ${C_BOLD}0)${C_RESET} ${C_RED}Отказаться от 2-го IP (Режим одного IP / Single-IP)${C_RESET}"
 
-# Умная подсказка по умолчанию: если на шаге 1 выбрали 1, предлагаем 2; если выбрали 2 — предлагаем 1
 if [[ "$main_choice" == "1" && -n "$slot2_cidr" ]]; then
     def_sec_choice="2"
 elif [[ "$main_choice" == "2" && -n "$slot1_cidr" ]]; then
@@ -229,7 +228,6 @@ while true; do
             ;;
     esac
 
-    # Проверка на совпадение с Главным IP
     candidate_pure=$(strip_mask "$ip_sec_input")
     if [[ "$candidate_pure" == "$ip_main_pure" ]]; then
         echo -e "   ${C_RED}🚫 Ошибка: Второй IP ($candidate_pure) совпадает с Главным IP! Выбери другой вариант или 0.${C_RESET}"
@@ -244,7 +242,6 @@ if [[ -n "$ip_sec_input" ]]; then
     ip_sec_input=$(ensure_mask "$ip_sec_input" "24")
     ip_sec_pure=$(strip_mask "$ip_sec_input")
 
-    # Если оба IP из одной /24 подсети, предлагаем тот же шлюз, иначе вычисляем .1
     main_prefix=$(echo "$ip_main_pure" | cut -d. -f1-3)
     sec_prefix=$(echo "$ip_sec_pure" | cut -d. -f1-3)
     if [[ "$main_prefix" == "$sec_prefix" ]]; then
@@ -275,7 +272,6 @@ if [[ -n "$detected_lan" ]]; then
     fi
 fi
 
-# Подсчет активных IPv4
 ipv4_count=1
 [[ -n "$ip_sec_input" ]] && ipv4_count=2
 
@@ -286,7 +282,6 @@ ipv4_count=1
 mkdir -p "$BACKUP_DIR"
 if compgen -G "/etc/netplan/*.yaml" > /dev/null; then
     cp -a /etc/netplan/*.yaml "$BACKUP_DIR"/
-    # Удаляем сторонние yaml (например, 50-cloud-init.yaml), чтобы они не конфликтовали
     rm -f /etc/netplan/*.yaml
 fi
 
@@ -315,9 +310,9 @@ fi
         echo "          - \"2001:4860:4860::8888\""
     fi
 
-    # 3.3 Маршруты (SMART ROUTING + PREFSRC)
+    # 3.3 Маршруты (SMART ROUTING + PREFSRC + SYMMETRIC INPUT)
     echo "      routes:"
-    # Главный системный маршрут (Таблица main, Приоритет 50, жесткий from)
+    # Главный маршрут (Таблица main, Приоритет 50 — весь исходящий трафик идет отсюда)
     echo "        - to: 0.0.0.0/0"
     echo "          via: $gw_main"
     echo "          from: $ip_main_pure"
@@ -325,21 +320,23 @@ fi
     echo "          on-link: true"
 
     if [[ $ipv4_count -eq 2 ]]; then
-        # Резервный маршрут в таблице main (Приоритет 200 — защита от rp_filter и отказоустойчивость)
+        # Второй маршрут в таблице main (Приоритет 200 — для видимости в main и отказоустойчивости)
         echo "        - to: 0.0.0.0/0"
         echo "          via: $gw_sec"
         echo "          from: $ip_sec_pure"
         echo "          metric: 200"
         echo "          on-link: true"
 
-        # Изолированная таблица 100 для Главного IP
+        # Изолированная таблица 100: гарантирует, что клиенты со СТАРЫМ DNS (стучащиеся на Главный IP)
+        # получат ответ строго с Главного IP
         echo "        - to: 0.0.0.0/0"
         echo "          via: $gw_main"
         echo "          from: $ip_main_pure"
         echo "          table: 100"
         echo "          on-link: true"
 
-        # Изолированная таблица 101 для Второго IP
+        # Изолированная таблица 101: гарантирует, что клиенты с НОВЫМ DNS (стучащиеся на Второй IP)
+        # получат ответ строго со Второго IP
         echo "        - to: 0.0.0.0/0"
         echo "          via: $gw_sec"
         echo "          from: $ip_sec_pure"
@@ -353,7 +350,7 @@ fi
         echo "          on-link: true"
     fi
 
-    # 3.4 Политики PBR (ТОЛЬКО ДЛЯ DUAL-IP)
+    # 3.4 Политики PBR (обеспечивают одновременный прием входящих на оба IP)
     if [[ $ipv4_count -eq 2 ]]; then
         echo "      routing-policy:"
         echo "        - from: $ip_main_pure"
@@ -376,35 +373,48 @@ fi
 chmod 600 "$CONFIG_FILE"
 
 # ==============================================================================
-# 4. ПРОВЕРКА И ПРИМЕНЕНИЕ
+# 4. ПРОВЕРКА, SYSCTL И ПРИМЕНЕНИЕ
 # ==============================================================================
 
 echo -e "\n📄 Проверяю синтаксис сгенерированного файла..."
 netplan generate || restore_and_exit
 
-# Ослабляем rp_filter до loose-режима (2), если активен Dual-IP, чтобы ядро не дропало пакеты
+# Постоянная настройка rp_filter=2 (переживает перезагрузку сервера!)
 if [[ $ipv4_count -eq 2 ]]; then
-    sysctl -w net.ipv4.conf.all.rp_filter=2 >/dev/null 2>&1 || true
-    sysctl -w net.ipv4.conf."$WAN_IF".rp_filter=2 >/dev/null 2>&1 || true
+    cat <<EOF > "$SYSCTL_FILE"
+# Alchemist Multi-IP PBR Routing Settings (Persistent across reboots)
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+net.ipv4.conf.${WAN_IF}.rp_filter = 2
+EOF
+    sysctl --system >/dev/null 2>&1 || true
+else
+    rm -f "$SYSCTL_FILE"
+    sysctl --system >/dev/null 2>&1 || true
 fi
 
 echo -e "\n${C_GREEN}✅ Конфигурация валидна! Сводка перед применением:${C_RESET}"
-echo "----------------------------------------------------------------------------"
+echo "--------------------------------------------------------------------------------"
 echo -e "Интерфейс WAN:          ${C_BOLD}$WAN_IF${C_RESET}"
-echo -e "Главный IP (Выход):     ${C_BLUE}$ip_main_input${C_RESET} (via $gw_main, metric 50)"
+echo -e "Главный IP (Выход+Вход):${C_BLUE} $ip_main_input${C_RESET} (via $gw_main, metric 50, Table 100)"
 if [[ $ipv4_count -eq 2 ]]; then
-    echo -e "Второй IP (Вход VPN):   ${C_ORANGE}$ip_sec_input${C_RESET} (via $gw_sec, metric 200)"
-    echo -e "Режим маршрутизации:    ${C_GREEN}АКТИВЕН PBR (Dual-IP: Table 100 & 101)${C_RESET}"
+    echo -e "Второй IP (Вход VPN):   ${C_ORANGE}$ip_sec_input${C_RESET} (via $gw_sec, metric 200, Table 101)"
+    echo -e "Режим маршрутизации:    ${C_GREEN}АКТИВЕН PBR (Оба IP работают на вход, выход с Главного)${C_RESET}"
 else
     echo -e "Второй IP (Вход VPN):   ОТКЛЮЧЕН"
     echo -e "Режим маршрутизации:    ${C_CYAN}СТАНДАРТНЫЙ (Single-IP)${C_RESET}"
 fi
 echo -e "Бэкап старых конфигов:  $BACKUP_DIR"
-echo "----------------------------------------------------------------------------"
+echo "--------------------------------------------------------------------------------"
 echo -e "${C_ORANGE}⏳ Запускаю 'netplan try'. Нажми ENTER, чтобы подтвердить настройки!${C_RESET}"
 
 if ! netplan try; then
     restore_and_exit
+fi
+
+# Сброс старых привязок NAT в conntrack (если установлен conntrack), чтобы трафик сразу пошел с нового IP
+if command -v conntrack >/dev/null 2>&1; then
+    conntrack -F >/dev/null 2>&1 || true
 fi
 
 echo -e "\n${C_GREEN}🚀 Сеть успешно перестроена! Текущий исходящий IP сервера:${C_RESET}"
